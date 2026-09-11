@@ -1,0 +1,23 @@
+{
+  "name": "kutub2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "module": "src/index.ts",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "deploy-commands": "bun run src/deploy-commands.ts",
+    "api": "bun run src/api/server.ts",
+    "api:dev": "bun run --watch src/api/server.ts",
+    "scrape:ar": "bun run src/scripts/scrape-arabic-library.ts",
+    "scrape:shamela": "bun run src/shamela/scrape.ts"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "node-html-parser": "^9.0.4"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
