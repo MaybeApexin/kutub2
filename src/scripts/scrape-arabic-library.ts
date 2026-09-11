@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { fetchArabicSections, fetchBookIndex, type LanguageSection } from "../lib/scraper.ts";
 import { normalizeAuthorKey } from "../lib/text-normalize.ts";
 
@@ -14,6 +16,12 @@ const DB_PATH = process.env.BOOKS_DB_PATH ?? "data/books.sqlite";
 const DELAY_MS = 300; // be light on the source server between section fetches
 
 function setupDatabase(path: string): Database {
+  // `data/` is never committed to git — it holds only the gitignored .sqlite
+  // output, and git doesn't track empty directories at all — so a fresh clone
+  // (e.g. onto a new VPS) has no data/ directory yet. `create: true` below makes
+  // the database *file*, not missing parent directories; without this, that fails
+  // with SQLITE_CANTOPEN.
+  mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path, { create: true });
   // Rebuilt fresh each run so schema changes (like adding book_type) don't require
   // a migration step — this script is the source of truth for the table shape.

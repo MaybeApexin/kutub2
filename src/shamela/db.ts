@@ -1,9 +1,17 @@
 import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { normalizeAuthorKey } from "../lib/text-normalize.ts";
 
 const DB_PATH = process.env.SHAMELA_DB_PATH ?? "data/shamela.sqlite";
 
 export function setupDatabase(path: string = DB_PATH): Database {
+  // `data/` is never committed to git — it holds only the gitignored .sqlite
+  // output, and git doesn't track empty directories at all — so a fresh clone
+  // (e.g. onto a new VPS) has no data/ directory yet. `create: true` below makes
+  // the database *file*, not missing parent directories; without this, that fails
+  // with SQLITE_CANTOPEN.
+  mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path, { create: true });
   // Rebuilt fresh each run, same rationale as kutub2's scrape-arabic-library.ts:
   // simplest way to keep the schema and script in sync without a migration step.

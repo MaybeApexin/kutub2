@@ -157,6 +157,24 @@ CREATE TABLE book_authors (
 
 **Multiple authors:** shamela.ws structurally links only one author per book (a stable `author/N` id), even for books that are genuinely co-authored. Its free-text "المؤلف:" description line does list every author when there's more than one, joined by "و" ("and") — so [author-split.ts](src/shamela/author-split.ts) splits that line back into separate names and links each as a co-author. This is a text heuristic, not real parsing, and it was tuned against real false positives found by manually auditing every multi-author result across the full catalog — e.g. a name that itself starts with the letter و ("ابن وهب"), and "و" connecting two facts about one author rather than naming a second one ("...المشهور (أبو بكر)...", "لا تصح نسبته...", an alias introduction). After that tuning it flags 6 books as multi-author, all of which check out as genuine on inspection (e.g. تفسير الجلالين, authored jointly by al-Mahalli and al-Suyuti; a father-and-son continuation on الإبهاج في شرح المنهاج). It can still miss or misjudge a case worded differently than anything seen so far.
 
+## Running as a service (systemd)
+
+`bun run dev` (and `start`) only stay alive as long as the shell that launched them does — closing an SSH session kills the bot. For a VPS, [deploy/kutub2-bot.service](deploy/kutub2-bot.service) is a systemd unit that keeps it running in the background, restarting it on crash and on reboot.
+
+It deliberately does **not** wrap `bun run dev`: `--watch` is a development convenience (auto-reload on file changes), not a way to survive crashes — systemd's own `Restart=always` is the actual right tool for that, so the unit runs the plain `bun run src/index.ts` instead.
+
+```bash
+bash deploy/install-service.sh   # run on the VPS, from inside the project directory
+```
+
+This fills in the current user, the current directory, and the `bun` binary on `PATH`, installs the unit to `/etc/systemd/system/`, and enables + starts it — needs `sudo` for the systemd steps, everything else runs as you. Bun auto-loads `.env` from the working directory, so no separate secrets configuration is needed. One hardening detail worth knowing if you ever edit the unit by hand: it sets `ProtectHome=read-only`, not `true` — Bun's default install puts the binary at `~/.bun/bin/bun`, and a full home lockout would make systemd unable to even execute it.
+
+```bash
+sudo systemctl status kutub2-bot     # is it running?
+journalctl -u kutub2-bot -f          # follow logs live
+sudo systemctl restart kutub2-bot    # restart after a code/env change
+```
+
 ## Project structure
 
 ```text
@@ -188,6 +206,9 @@ src/
     author-split.ts          # free-text "المؤلف:" line -> individual author names
     db.ts                    # schema + upsert helpers (authors / books / book_authors)
     scrape.ts                # entrypoint (bun run scrape:shamela)
+deploy/
+  kutub2-bot.service     # systemd unit for the Discord bot (see "Running as a service")
+  install-service.sh     # fills in the unit's placeholders and installs it
 ```
 
 To add a new Discord command, create a file in `src/commands/` exporting `data` (a `SlashCommandBuilder`) and `execute`, then register it in both `src/index.ts` and `src/deploy-commands.ts`.

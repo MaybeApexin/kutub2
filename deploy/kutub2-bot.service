@@ -1,0 +1,31 @@
+[Unit]
+Description=kutub2 Discord bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=REPLACE_WITH_YOUR_USERNAME
+WorkingDirectory=REPLACE_WITH_PROJECT_PATH
+ExecStart=REPLACE_WITH_BUN_PATH run src/index.ts
+Restart=always
+RestartSec=5
+
+# Bun auto-loads .env from WorkingDirectory — no EnvironmentFile= needed here.
+
+# Hardening: the bot only ever reads data/*.sqlite at runtime (db.ts opens it
+# readonly) and writes nothing to disk itself — scraping happens separately via
+# `bun run scrape:shamela`, not under this service — so it's safe to lock the
+# filesystem down almost entirely. ProtectHome is "read-only", not "true": Bun's
+# default per-user install puts the binary at ~/.bun/bin/bun, and a full home
+# lockout would make that binary — and likely the project directory too, if it
+# lives under $HOME — impossible for this service to even execute.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
