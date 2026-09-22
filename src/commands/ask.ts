@@ -4,14 +4,13 @@ import { getRelevantBookText, formatContextForPrompt } from "../lib/book-retriev
 import { askGeminiJSON } from "../lib/gemini.ts";
 import { handleBookPickerAutocomplete, truncate } from "../lib/book-picker.ts";
 import { createCooldown } from "../lib/command-cooldown.ts";
-import { CITATION_ANSWER_SCHEMA, verifyCitations, type AnswerWithCitations, type VerifiedClaim } from "../lib/citation.ts";
+import { CITATION_ANSWER_SCHEMA, verifyCitations, type AnswerWithCitations } from "../lib/citation.ts";
 
 // ~2.5 chars/token is a safe estimate for this Arabic source text.
 const MAX_CONTEXT_CHARS = Number(process.env.GEMINI_MAX_CONTEXT_CHARS ?? 12_000);
 
-// 10 embeds/message is Discord's hard limit; 1 is reserved for the book-card meta
-// embed, leaving this many for individual claim citations.
-const MAX_CLAIM_EMBEDS = 9;
+// Discord's own per-embed field cap.
+const MAX_REFERENCES = 25;
 
 // Each /ask call makes 2 Gemini requests (search-term extraction + the answer),
 // and this account's key is capped at 5 requests per minute — shared across every
@@ -179,47 +178,75 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         { name: "Question", value: truncate(question, 1024) },
       );
     if (book.author_name) metaEmbed.setAuthor({ name: truncate(book.author_name, 256) });
-    if (verifiedClaims.length === 0) {
-      metaEmbed.addFields({ name: "No answer", value: "The excerpt didn't support any citable claim for this question." });
-    } else if (verifiedClaims.length > MAX_CLAIM_EMBEDS) {
-      metaEmbed.addFields({ name: "Note", value: `Showing ${MAX_CLAIM_EMBEDS} of ${verifiedClaims.length} claims.` });
+
+    // Assign each distinct {page, paragraph} a stable footnote-style number, in
+    // order of first appearance across claims, so the same cited paragraph reused
+    // by two claims gets one shared number rather than two.
+    const citationKey = (page: number, paragraph: number) => `${page}:${paragraph}`;
+    const citationNumbers = new Map<string, number>();
+    const references: { number: number; page: number; paragraph: number; verified: boolean; snippet?: string }[] = [];
+    let anyUncitedClaims = false;
+
+    for (const claim of verifiedClaims) {
+      if (claim.citations.length === 0) anyUncitedClaims = true;
+      for (const c of claim.citations) {
+        const key = citationKey(c.page, c.paragraph);
+        if (!citationNumbers.has(key)) {
+          citationNumbers.set(key, references.length + 1);
+          references.push({ number: references.length + 1, page: c.page, paragraph: c.paragraph, verified: c.verified, snippet: c.snippet });
+        }
+      }
     }
 
-    // One embed per claim: green if every citation checks out against the
-    // paragraphs actually retrieved, red if any citation points somewhere the
-    // model never saw (a provable hallucination — see citation.ts), gray if the
-    // model gave no citation at all for that claim.
-    const claimEmbeds = verifiedClaims.slice(0, MAX_CLAIM_EMBEDS).map((claim: VerifiedClaim, i: number) => {
-      const allVerified = claim.citations.length > 0 && claim.citations.every((c) => c.verified);
-      const color = claim.citations.length === 0 ? 0x718096 : allVerified ? 0x38a169 : 0xe53e3e;
+    // Prose answer with inline [1][2] markers — "[!]" flags a claim the model
+    // gave no citation for at all, rather than silently presenting it as sourced.
+    const answerText =
+      verifiedClaims.length === 0
+        ? "The excerpt didn't support any citable claim for this question."
+        : verifiedClaims
+            .map((claim) => {
+              const markers =
+                claim.citations.length > 0
+                  ? claim.citations.map((c) => `[${citationNumbers.get(citationKey(c.page, c.paragraph))}]`).join("")
+                  : "[!]";
+              return `${claim.text} ${markers}`;
+            })
+            .join(" ");
 
-      const embed = new EmbedBuilder().setTitle(`Claim ${i + 1}`).setDescription(truncate(claim.text, 4000)).setColor(color);
+    const answerEmbed = new EmbedBuilder()
+      .setTitle("💬 Answer")
+      .setDescription(truncate(answerText, 4000))
+      .setColor(context.usedSearch ? 0x38a169 : 0xdd6b20);
 
-      if (claim.citations.length === 0) {
-        embed.addFields({ name: "⚠️ No citation", value: "The model gave no source for this claim." });
-      }
-      for (const c of claim.citations) {
-        embed.addFields(
-          c.verified
-            ? { name: `📖 Page ${c.page}, ¶${c.paragraph}`, value: truncate(c.snippet!, 1024) }
+    // One numbered field per citation — green-ish page marker when the cited
+    // paragraph checks out against what was actually retrieved, a warning marker
+    // when it doesn't (a provable hallucination — see citation.ts).
+    const referencesEmbed = new EmbedBuilder().setTitle("📚 Sources").setColor(0x4a5568);
+    if (references.length === 0) {
+      referencesEmbed.setDescription("No citations were given for this answer.");
+    } else {
+      for (const ref of references.slice(0, MAX_REFERENCES)) {
+        referencesEmbed.addFields(
+          ref.verified
+            ? { name: `📖 [${ref.number}] Page ${ref.page}, ¶${ref.paragraph}`, value: truncate(ref.snippet!, 1024) }
             : {
-                name: `⚠️ Page ${c.page}, ¶${c.paragraph}`,
+                name: `⚠️ [${ref.number}] Page ${ref.page}, ¶${ref.paragraph}`,
                 value: "This citation doesn't match any paragraph actually retrieved for this answer — treat it with caution.",
               },
         );
       }
-      return embed;
-    });
-
-    // Footer goes on the last embed in the message (Discord doesn't render a
-    // footer on anything but where it's set) — the last claim embed when there
-    // is one, otherwise the meta embed itself.
+      if (references.length > MAX_REFERENCES) {
+        footerNotes.push(`Showing ${MAX_REFERENCES} of ${references.length} citations.`);
+      }
+    }
+    if (anyUncitedClaims) {
+      footerNotes.push("[!] marks a claim the model gave no citation for.");
+    }
     if (footerNotes.length > 0) {
-      const footerTarget = claimEmbeds[claimEmbeds.length - 1] ?? metaEmbed;
-      footerTarget.setFooter({ text: footerNotes.join(" ") });
+      referencesEmbed.setFooter({ text: footerNotes.join(" ") });
     }
 
-    await interaction.editReply({ embeds: [metaEmbed, ...claimEmbeds] });
+    await interaction.editReply({ embeds: [metaEmbed, answerEmbed, referencesEmbed] });
   } catch (error) {
     console.error("Error in /ask:", error);
     await interaction.editReply(
