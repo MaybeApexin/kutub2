@@ -58,6 +58,11 @@ export const data = new SlashCommandBuilder()
       .setName("question")
       .setDescription("Your question, argument, or claim — required")
       .setMaxLength(500),
+  )
+  .addBooleanOption((opt) =>
+    opt
+      .setName("images")
+      .setDescription("Also attach a highlighted page image per citation (default: off — text stays copy-pasteable)"),
   );
 
 export const autocomplete = handleBookPickerAutocomplete;
@@ -65,6 +70,7 @@ export const autocomplete = handleBookPickerAutocomplete;
 export async function execute(interaction: ChatInputCommandInteraction) {
   const bookUri = interaction.options.getString("book");
   const question = interaction.options.getString("question");
+  const wantImages = interaction.options.getBoolean("images") ?? false;
 
   if (!bookUri) {
     await interaction.reply({
@@ -255,43 +261,49 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     if (anyUncitedClaims) {
       footerNotes.push("[!] marks a claim the model gave no citation for.");
     }
-    // Render one image per distinct cited page — grouping by page (not one image
-    // per citation) so two citations landing on the same page share a single
-    // image with two differently-colored highlights, matching how a real page
-    // actually looks. Only verified citations get an image: an unverified one
-    // means the model named a paragraph that was never actually retrieved, so
-    // there's nothing real to highlight — it stays a text-only warning above.
-    const verifiedReferences = references.filter((r) => r.verified);
-    const pagesInOrder: number[] = [];
-    const highlightsByPage = new Map<number, PageHighlight[]>();
-    for (const ref of verifiedReferences) {
-      let highlights = highlightsByPage.get(ref.page);
-      if (!highlights) {
-        highlights = [];
-        highlightsByPage.set(ref.page, highlights);
-        pagesInOrder.push(ref.page);
-      }
-      const color = HIGHLIGHT_PALETTE[highlights.length % HIGHLIGHT_PALETTE.length]!;
-      highlights.push({ paragraph: ref.paragraph, color, citationNumber: ref.number });
-    }
-
-    const pagesToRender = pagesInOrder.slice(0, MAX_PAGE_IMAGES);
-    if (pagesInOrder.length > MAX_PAGE_IMAGES) {
-      footerNotes.push(`Showing page images for ${MAX_PAGE_IMAGES} of ${pagesInOrder.length} cited pages.`);
-    }
-
-    const rendered = await Promise.allSettled(
-      pagesToRender.map((page) => renderPageImage(book.uri, page, highlightsByPage.get(page)!)),
-    );
+    // Page images are opt-in via the `images` option — default stays the plain
+    // text citation list so the answer is fully copy-pasteable by default; only
+    // do the extra page fetches/renders when actually asked for.
     const attachments: AttachmentBuilder[] = [];
-    rendered.forEach((outcome, i) => {
-      const page = pagesToRender[i]!;
-      if (outcome.status === "fulfilled") {
-        attachments.push(new AttachmentBuilder(outcome.value, { name: `page-${page}.png` }));
-      } else {
-        console.error(`Failed to render page image for page ${page}:`, outcome.reason);
+    if (wantImages) {
+      // Render one image per distinct cited page — grouping by page (not one
+      // image per citation) so two citations landing on the same page share a
+      // single image with two differently-colored highlights, matching how a
+      // real page actually looks. Only verified citations get an image: an
+      // unverified one means the model named a paragraph that was never
+      // actually retrieved, so there's nothing real to highlight — it stays a
+      // text-only warning above.
+      const verifiedReferences = references.filter((r) => r.verified);
+      const pagesInOrder: number[] = [];
+      const highlightsByPage = new Map<number, PageHighlight[]>();
+      for (const ref of verifiedReferences) {
+        let highlights = highlightsByPage.get(ref.page);
+        if (!highlights) {
+          highlights = [];
+          highlightsByPage.set(ref.page, highlights);
+          pagesInOrder.push(ref.page);
+        }
+        const color = HIGHLIGHT_PALETTE[highlights.length % HIGHLIGHT_PALETTE.length]!;
+        highlights.push({ paragraph: ref.paragraph, color, citationNumber: ref.number });
       }
-    });
+
+      const pagesToRender = pagesInOrder.slice(0, MAX_PAGE_IMAGES);
+      if (pagesInOrder.length > MAX_PAGE_IMAGES) {
+        footerNotes.push(`Showing page images for ${MAX_PAGE_IMAGES} of ${pagesInOrder.length} cited pages.`);
+      }
+
+      const rendered = await Promise.allSettled(
+        pagesToRender.map((page) => renderPageImage(book.uri, page, highlightsByPage.get(page)!)),
+      );
+      rendered.forEach((outcome, i) => {
+        const page = pagesToRender[i]!;
+        if (outcome.status === "fulfilled") {
+          attachments.push(new AttachmentBuilder(outcome.value, { name: `page-${page}.png` }));
+        } else {
+          console.error(`Failed to render page image for page ${page}:`, outcome.reason);
+        }
+      });
+    }
 
     if (footerNotes.length > 0) {
       referencesEmbed.setFooter({ text: footerNotes.join(" ") });
