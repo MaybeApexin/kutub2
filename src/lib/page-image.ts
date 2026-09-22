@@ -36,11 +36,12 @@ const FOOTNOTE_FONT_SIZE = 20; // matches the real site: hashiyah renders visibl
 const LINE_HEIGHT_RATIO = 1.7;
 const PARAGRAPH_GAP = 16;
 const BACKGROUND = "#faf6ec";
-// "body" (the faqarat — the actual paragraph/verse text) is dark red; "title"
-// (a paragraph that's entirely a bracketed editorial annotation, e.g.
-// "[قافية التاء]") and "footnote" (hamesh) both render in the same gray — see
-// ParagraphKind's docs in shamela-reader.ts for how these are detected.
-const BODY_COLOR = "#7a1420";
+// "body" (the faqarat — the actual paragraph/verse text) stays plain black;
+// "title" (a paragraph that's entirely a bracketed editorial annotation, e.g.
+// "[قافية التاء]") is dark red; "footnote" (hamesh) is gray — see ParagraphKind's
+// docs in shamela-reader.ts for how these are detected.
+const BODY_COLOR = "#20201c";
+const TITLE_COLOR = "#7a1420";
 const MUTED_COLOR = "#6b6b6b";
 const CONTENT_WIDTH = WIDTH - MARGIN_X * 2;
 
@@ -49,7 +50,9 @@ function fontSizeForKind(kind: ParagraphKind): number {
 }
 
 function colorForKind(kind: ParagraphKind): string {
-  return kind === "body" ? BODY_COLOR : MUTED_COLOR;
+  if (kind === "title") return TITLE_COLOR;
+  if (kind === "footnote") return MUTED_COLOR;
+  return BODY_COLOR;
 }
 
 interface LaidOutLine {
@@ -117,11 +120,11 @@ function layOutPage(
  * fetchShamelaPage's docs), and this is a generated image, not an actual scan.
  * Mislabeling either would overstate how authoritative this image is.
  *
- * `kinds`, when given (same length/order as `paragraphs`), colors the faqarat
- * dark red and titles/hashiyah gray (hashiyah also renders smaller), matching
- * shamela.ws's own convention — see ParagraphKind in shamela-reader.ts. Omitted
- * entirely, every paragraph is treated as "body" (plain dark red), which is
- * exactly what most ordinary prose pages are anyway.
+ * `kinds`, when given (same length/order as `paragraphs`), colors editorial
+ * titles dark red and footnotes gray (also rendering them smaller); the
+ * paragraph/verse text itself (faqarat) stays plain black — see ParagraphKind
+ * in shamela-reader.ts. Omitted entirely, every paragraph is treated as "body"
+ * (plain black), which is exactly what most ordinary prose pages are anyway.
  */
 export function drawPageImage(
   paragraphs: string[],
@@ -163,8 +166,8 @@ export function drawPageImage(
 
   // Body text: highlight rectangle first (so it sits behind the glyphs like a
   // real highlighter stroke), then the line's text on top, sized and colored by
-  // its paragraph's kind (faqarat dark red at full size; titles/hashiyah gray,
-  // hashiyah also smaller).
+  // its paragraph's kind (faqarat plain black at full size; titles dark red;
+  // hashiyah gray and smaller).
   ctx.direction = "rtl";
   ctx.textAlign = "right";
   for (const line of lines) {
