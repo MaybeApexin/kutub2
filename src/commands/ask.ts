@@ -1,16 +1,29 @@
-import { SlashCommandBuilder, EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { SlashCommandBuilder, EmbedBuilder, AttachmentBuilder, type ChatInputCommandInteraction } from "discord.js";
 import { getBookByUri } from "../lib/db.ts";
 import { getRelevantBookText, formatContextForPrompt } from "../lib/book-retrieval.ts";
 import { askGeminiJSON } from "../lib/gemini.ts";
 import { handleBookPickerAutocomplete, truncate } from "../lib/book-picker.ts";
 import { createCooldown } from "../lib/command-cooldown.ts";
 import { CITATION_ANSWER_SCHEMA, verifyCitations, type AnswerWithCitations } from "../lib/citation.ts";
+import { renderPageImage, type PageHighlight } from "../lib/page-image.ts";
 
 // ~2.5 chars/token is a safe estimate for this Arabic source text.
 const MAX_CONTEXT_CHARS = Number(process.env.GEMINI_MAX_CONTEXT_CHARS ?? 12_000);
 
 // Discord's own per-embed field cap.
 const MAX_REFERENCES = 25;
+
+// Discord allows more attachments per message than this, but each is a real
+// render (a shamela.ws page fetch + canvas draw) — keep it well under both
+// Discord's limit and a sane per-response cost.
+const MAX_PAGE_IMAGES = 6;
+
+// A page can carry more than one citation (two different cited paragraphs on the
+// same page) — each gets a different color from this palette, cycling if a page
+// somehow has more citations than colors. None of these are red: red already
+// means "unverified citation" in the Sources embed, and reusing it here would
+// contradict that — every citation that gets an image passed verification.
+const HIGHLIGHT_PALETTE = ["#ffe066", "#8ce99a", "#a5d8ff", "#ffc9de"];
 
 // Each /ask call makes 2 Gemini requests (search-term extraction + the answer),
 // and this account's key is capped at 5 requests per minute — shared across every
@@ -242,11 +255,49 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     if (anyUncitedClaims) {
       footerNotes.push("[!] marks a claim the model gave no citation for.");
     }
+    // Render one image per distinct cited page — grouping by page (not one image
+    // per citation) so two citations landing on the same page share a single
+    // image with two differently-colored highlights, matching how a real page
+    // actually looks. Only verified citations get an image: an unverified one
+    // means the model named a paragraph that was never actually retrieved, so
+    // there's nothing real to highlight — it stays a text-only warning above.
+    const verifiedReferences = references.filter((r) => r.verified);
+    const pagesInOrder: number[] = [];
+    const highlightsByPage = new Map<number, PageHighlight[]>();
+    for (const ref of verifiedReferences) {
+      let highlights = highlightsByPage.get(ref.page);
+      if (!highlights) {
+        highlights = [];
+        highlightsByPage.set(ref.page, highlights);
+        pagesInOrder.push(ref.page);
+      }
+      const color = HIGHLIGHT_PALETTE[highlights.length % HIGHLIGHT_PALETTE.length]!;
+      highlights.push({ paragraph: ref.paragraph, color, citationNumber: ref.number });
+    }
+
+    const pagesToRender = pagesInOrder.slice(0, MAX_PAGE_IMAGES);
+    if (pagesInOrder.length > MAX_PAGE_IMAGES) {
+      footerNotes.push(`Showing page images for ${MAX_PAGE_IMAGES} of ${pagesInOrder.length} cited pages.`);
+    }
+
+    const rendered = await Promise.allSettled(
+      pagesToRender.map((page) => renderPageImage(book.uri, page, highlightsByPage.get(page)!)),
+    );
+    const attachments: AttachmentBuilder[] = [];
+    rendered.forEach((outcome, i) => {
+      const page = pagesToRender[i]!;
+      if (outcome.status === "fulfilled") {
+        attachments.push(new AttachmentBuilder(outcome.value, { name: `page-${page}.png` }));
+      } else {
+        console.error(`Failed to render page image for page ${page}:`, outcome.reason);
+      }
+    });
+
     if (footerNotes.length > 0) {
       referencesEmbed.setFooter({ text: footerNotes.join(" ") });
     }
 
-    await interaction.editReply({ embeds: [metaEmbed, answerEmbed, referencesEmbed] });
+    await interaction.editReply({ embeds: [metaEmbed, answerEmbed, referencesEmbed], files: attachments });
   } catch (error) {
     console.error("Error in /ask:", error);
     await interaction.editReply(
