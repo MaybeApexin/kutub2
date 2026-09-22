@@ -3,3 +3,4 @@ node_modules/
 dist/
 *.log
 data/*.sqlite
+.DS_Store
