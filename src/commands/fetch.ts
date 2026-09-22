@@ -9,7 +9,7 @@ import {
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { getBookByUri } from "../lib/db.ts";
-import { fetchShamelaPage } from "../lib/shamela-reader.ts";
+import { fetchShamelaPage, type ParagraphKind } from "../lib/shamela-reader.ts";
 import { handleBookPickerAutocomplete, truncate } from "../lib/book-picker.ts";
 import { drawPageImage } from "../lib/page-image.ts";
 
@@ -77,6 +77,9 @@ interface PageBlock {
   /** Same paragraphs `text` is joined from — kept separately so a page image can
    *  be drawn from data already in hand instead of refetching the page. */
   paragraphs: string[];
+  /** Same length/order as `paragraphs` — drives dark-red/gray/small-footnote
+   *  styling in the page image. */
+  paragraphKinds: ParagraphKind[];
 }
 
 interface Chunk {
@@ -117,7 +120,7 @@ export async function loadChunkForward(
 
     const text = fetched.paragraphs.join("\n\n");
     if (text) {
-      pages.push({ pageNumber: page, url: fetched.url, text, paragraphs: fetched.paragraphs });
+      pages.push({ pageNumber: page, url: fetched.url, text, paragraphs: fetched.paragraphs, paragraphKinds: fetched.paragraphKinds });
       length += text.length;
     }
     if (length >= maxChars || pages.length >= maxPages) {
@@ -152,7 +155,7 @@ export async function loadChunkBackward(
 
     const text = fetched.paragraphs.join("\n\n");
     if (text) {
-      pages.unshift({ pageNumber: page, url: fetched.url, text, paragraphs: fetched.paragraphs });
+      pages.unshift({ pageNumber: page, url: fetched.url, text, paragraphs: fetched.paragraphs, paragraphKinds: fetched.paragraphKinds });
       length += text.length;
     }
     if (length >= maxChars || pages.length >= maxPages) {
@@ -279,7 +282,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       if (wantImages) {
         for (const p of chunk.pages) {
           try {
-            attachments.push(new AttachmentBuilder(drawPageImage(p.paragraphs, p.pageNumber), { name: `page-${p.pageNumber}.png` }));
+            attachments.push(
+              new AttachmentBuilder(drawPageImage(p.paragraphs, p.pageNumber, [], p.paragraphKinds), { name: `page-${p.pageNumber}.png` }),
+            );
           } catch (err) {
             console.error(`Failed to render page image for page ${p.pageNumber}:`, err);
           }

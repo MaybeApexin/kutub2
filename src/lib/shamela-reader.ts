@@ -3,12 +3,26 @@ import { parse, type HTMLElement } from "node-html-parser";
 const USER_AGENT =
   "kutub2-bot/0.1 (+https://github.com/; respectful indexer, low request volume)";
 
+/**
+ * A paragraph's structural role, for display only (grounding text for /ask
+ * doesn't care about this). "footnote" is a reliable, site-wide signal — a
+ * <p class="hamesh"> block. "title" is a plain-text pattern (a paragraph that's
+ * entirely a bracketed editorial annotation, e.g. "[قافية التاء]") — the generic
+ * cN classes shamela.ws's editors use for inline styling were checked empirically
+ * and are NOT reliable across books (the same class number means "verse number"
+ * in one book's edition and "quoted hadith" in another's), so those are
+ * deliberately not used here. Everything else is "body" — the default.
+ */
+export type ParagraphKind = "body" | "title" | "footnote";
+
 export interface ShamelaPage {
   url: string;
   pageNumber: number;
   /** The book's final page number, read off the page's own "jump to last page" link. */
   lastPageNumber: number;
   paragraphs: string[];
+  /** Same length/order as `paragraphs` — each entry's structural role. */
+  paragraphKinds: ParagraphKind[];
   /**
    * The nearest enclosing named heading from the book's own table of contents (a
    * كتاب/باب/مسألة entry, e.g. "٧٤٩ - مسألة؛ قال: (ومن باع سلعة بنسيئة...)") — null if
@@ -119,10 +133,21 @@ export async function fetchShamelaPage(bookUrl: string, pageNumber = 1): Promise
     );
   }
 
-  const paragraphs = nass
-    .querySelectorAll("p")
-    .map((p) => text(p))
-    .filter(Boolean);
+  const paragraphs: string[] = [];
+  const paragraphKinds: ParagraphKind[] = [];
+  for (const p of nass.querySelectorAll("p")) {
+    const t = text(p);
+    if (!t) continue;
+    paragraphs.push(t);
+    const classes = (p.getAttribute("class") ?? "").split(/\s+/);
+    if (classes.includes("hamesh")) {
+      paragraphKinds.push("footnote");
+    } else if (/^\[.+\]$/.test(t)) {
+      paragraphKinds.push("title");
+    } else {
+      paragraphKinds.push("body");
+    }
+  }
 
   // Every page carries "jump to first/prev/next/last page" links pointing at
   // /book/{id}/{N}; the largest N among them — including any page links in the
@@ -138,7 +163,7 @@ export async function fetchShamelaPage(bookUrl: string, pageNumber = 1): Promise
   const lastPageNumber = linkedPageNumbers.length > 0 ? Math.max(...linkedPageNumbers) : pageNumber;
   const sectionHeading = findSectionHeading(root, bookId, pageNumber);
 
-  return { url: pageUrl, pageNumber, lastPageNumber, paragraphs, sectionHeading };
+  return { url: pageUrl, pageNumber, lastPageNumber, paragraphs, paragraphKinds, sectionHeading };
 }
 
 export interface ShamelaSearchHit {
