@@ -94,13 +94,16 @@ interface Chunk {
  * `toPage` (backward, for the Prev button, so it lands just before wherever the
  * current chunk starts), until roughly `maxChars` of text has been collected —
  * never crossing `scopeLimit` (the requested page / pageStart-pageEnd bound, or
- * Infinity/1 for an unscoped whole-book browse).
+ * Infinity/1 for an unscoped whole-book browse). `maxPages` overrides the default
+ * per-chunk page cap — image mode passes 1, so each navigation step is exactly
+ * one physical shamela.ws page instead of several combined.
  */
 export async function loadChunkForward(
   bookUri: string,
   fromPage: number,
   maxChars: number,
   scopeEnd = Infinity,
+  maxPages = MAX_PAGES_PER_CHUNK,
 ): Promise<Chunk> {
   let page = fromPage;
   const pages: PageBlock[] = [];
@@ -117,7 +120,7 @@ export async function loadChunkForward(
       pages.push({ pageNumber: page, url: fetched.url, text, paragraphs: fetched.paragraphs });
       length += text.length;
     }
-    if (length >= maxChars || pages.length >= MAX_PAGES_PER_CHUNK) {
+    if (length >= maxChars || pages.length >= maxPages) {
       return { startPage: fromPage, endPage: page, lastPageNumber, pages };
     }
     page++;
@@ -135,6 +138,7 @@ export async function loadChunkBackward(
   toPage: number,
   maxChars: number,
   scopeStart = 1,
+  maxPages = MAX_PAGES_PER_CHUNK,
 ): Promise<Chunk> {
   let page = toPage;
   const pages: PageBlock[] = [];
@@ -151,7 +155,7 @@ export async function loadChunkBackward(
       pages.unshift({ pageNumber: page, url: fetched.url, text, paragraphs: fetched.paragraphs });
       length += text.length;
     }
-    if (length >= maxChars || pages.length >= MAX_PAGES_PER_CHUNK) {
+    if (length >= maxChars || pages.length >= maxPages) {
       return { startPage: page, endPage: toPage, lastPageNumber, pages };
     }
     page--;
@@ -204,10 +208,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const scopeEnd = page ?? pageEndOpt ?? Infinity;
   const wantImages = interaction.options.getBoolean("images") ?? false;
 
+  // Image mode shows exactly one physical shamela.ws page per navigation step
+  // (not several combined, like the text mode's char-budget chunking does), since
+  // the image already stands alone as one screen's worth of content.
+  const chunkPageLimit = wantImages ? 1 : MAX_PAGES_PER_CHUNK;
+
   await interaction.deferReply();
 
   try {
-    let chunk = await loadChunkForward(book.uri, scopeStart, DISCORD_CHUNK_CHARS, scopeEnd);
+    let chunk = await loadChunkForward(book.uri, scopeStart, DISCORD_CHUNK_CHARS, scopeEnd, chunkPageLimit);
 
     const render = async () => {
       const lastPageShown = Math.min(chunk.lastPageNumber, scopeEnd);
@@ -226,17 +235,22 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         );
       if (book.author_name) metaEmbed.setAuthor({ name: truncate(book.author_name, 256) });
 
-      const pageEmbeds = chunk.pages.map(
-        (p, i) =>
-          new EmbedBuilder()
-            .setTitle(`── Page ${p.pageNumber} ──`)
-            .setURL(p.url)
-            .setDescription(truncate(p.text, 4000))
-            .setColor(PAGE_COLORS[i % PAGE_COLORS.length]!),
-      );
+      // In image mode the image is the content — skip the redundant text embeds
+      // entirely, short of the "nothing here" fallback for a page with no
+      // extractable text (which also means no image, so something must say so).
+      const pageEmbeds = wantImages
+        ? []
+        : chunk.pages.map(
+            (p, i) =>
+              new EmbedBuilder()
+                .setTitle(`── Page ${p.pageNumber} ──`)
+                .setURL(p.url)
+                .setDescription(truncate(p.text, 4000))
+                .setColor(PAGE_COLORS[i % PAGE_COLORS.length]!),
+          );
       // A chunk can legitimately have zero pages (every page in range had no
       // extractable text) — an embed with no description would be invalid.
-      if (pageEmbeds.length === 0) {
+      if (chunk.pages.length === 0) {
         pageEmbeds.push(new EmbedBuilder().setDescription("*(no extractable text on this page)*").setColor(PAGE_COLORS[0]!));
       }
 
@@ -295,9 +309,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
       const lastPageShown = Math.min(chunk.lastPageNumber, scopeEnd);
       if (btn.customId === "fetch_next" && chunk.endPage < lastPageShown) {
-        chunk = await loadChunkForward(book.uri, chunk.endPage + 1, DISCORD_CHUNK_CHARS, scopeEnd);
+        chunk = await loadChunkForward(book.uri, chunk.endPage + 1, DISCORD_CHUNK_CHARS, scopeEnd, chunkPageLimit);
       } else if (btn.customId === "fetch_prev" && chunk.startPage > scopeStart) {
-        chunk = await loadChunkBackward(book.uri, chunk.startPage - 1, DISCORD_CHUNK_CHARS, scopeStart);
+        chunk = await loadChunkBackward(book.uri, chunk.startPage - 1, DISCORD_CHUNK_CHARS, scopeStart, chunkPageLimit);
       }
 
       await btn.update(await render());
