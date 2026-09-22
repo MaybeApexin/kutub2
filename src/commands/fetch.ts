@@ -5,11 +5,13 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ComponentType,
+  AttachmentBuilder,
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { getBookByUri } from "../lib/db.ts";
 import { fetchShamelaPage } from "../lib/shamela-reader.ts";
 import { handleBookPickerAutocomplete, truncate } from "../lib/book-picker.ts";
+import { drawPageImage } from "../lib/page-image.ts";
 
 const DISCORD_CHUNK_CHARS = 3000; // soft target — several page embeds share Discord's 6000-char-per-message cap
 // Discord hard-caps a message at 10 embeds total; 1 is always the metadata embed,
@@ -59,6 +61,11 @@ export const data = new SlashCommandBuilder()
       .setName("pageend")
       .setDescription("Don't browse past this page (defaults to the book's last page)")
       .setMinValue(1),
+  )
+  .addBooleanOption((opt) =>
+    opt
+      .setName("images")
+      .setDescription("Also attach a plain page image per page shown, no highlighting (default: off)"),
   );
 
 export const autocomplete = handleBookPickerAutocomplete;
@@ -67,6 +74,9 @@ interface PageBlock {
   pageNumber: number;
   url: string;
   text: string;
+  /** Same paragraphs `text` is joined from — kept separately so a page image can
+   *  be drawn from data already in hand instead of refetching the page. */
+  paragraphs: string[];
 }
 
 interface Chunk {
@@ -104,7 +114,7 @@ export async function loadChunkForward(
 
     const text = fetched.paragraphs.join("\n\n");
     if (text) {
-      pages.push({ pageNumber: page, url: fetched.url, text });
+      pages.push({ pageNumber: page, url: fetched.url, text, paragraphs: fetched.paragraphs });
       length += text.length;
     }
     if (length >= maxChars || pages.length >= MAX_PAGES_PER_CHUNK) {
@@ -138,7 +148,7 @@ export async function loadChunkBackward(
 
     const text = fetched.paragraphs.join("\n\n");
     if (text) {
-      pages.unshift({ pageNumber: page, url: fetched.url, text });
+      pages.unshift({ pageNumber: page, url: fetched.url, text, paragraphs: fetched.paragraphs });
       length += text.length;
     }
     if (length >= maxChars || pages.length >= MAX_PAGES_PER_CHUNK) {
@@ -192,13 +202,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   const scopeStart = page ?? pageStartOpt ?? 1;
   const scopeEnd = page ?? pageEndOpt ?? Infinity;
+  const wantImages = interaction.options.getBoolean("images") ?? false;
 
   await interaction.deferReply();
 
   try {
     let chunk = await loadChunkForward(book.uri, scopeStart, DISCORD_CHUNK_CHARS, scopeEnd);
 
-    const render = () => {
+    const render = async () => {
       const lastPageShown = Math.min(chunk.lastPageNumber, scopeEnd);
       const rangeLabel =
         scopeStart === 1 && scopeEnd === Infinity
@@ -245,10 +256,29 @@ export async function execute(interaction: ChatInputCommandInteraction) {
           .setDisabled(atEnd),
       );
 
-      return { embeds: [metaEmbed, ...pageEmbeds], components: [row] };
+      // Plain (unhighlighted) page images, opt-in via the `images` option — off by
+      // default so the text embeds above stay the primary, copy-pasteable output.
+      // drawPageImage is pure/synchronous (no fetch: the paragraphs are already in
+      // hand from loadChunkForward/Backward), so this adds no extra shamela.ws
+      // traffic on top of what the text embeds already required.
+      const attachments: AttachmentBuilder[] = [];
+      if (wantImages) {
+        for (const p of chunk.pages) {
+          try {
+            attachments.push(new AttachmentBuilder(drawPageImage(p.paragraphs, p.pageNumber), { name: `page-${p.pageNumber}.png` }));
+          } catch (err) {
+            console.error(`Failed to render page image for page ${p.pageNumber}:`, err);
+          }
+        }
+      }
+
+      // `attachments: []` explicitly clears whatever images were on the message
+      // from a previous Prev/Next click — otherwise Discord appends rather than
+      // replaces, and old pages' images would pile up forever as you page through.
+      return { embeds: [metaEmbed, ...pageEmbeds], components: [row], files: attachments, attachments: [] };
     };
 
-    const message = await interaction.editReply(render());
+    const message = await interaction.editReply(await render());
     const collector = message.createMessageComponentCollector({
       componentType: ComponentType.Button,
       idle: IDLE_TIMEOUT_MS,
@@ -270,7 +300,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         chunk = await loadChunkBackward(book.uri, chunk.startPage - 1, DISCORD_CHUNK_CHARS, scopeStart);
       }
 
-      await btn.update(render());
+      await btn.update(await render());
     });
 
     collector.on("end", async () => {

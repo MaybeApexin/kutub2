@@ -61,13 +61,13 @@ function wrapParagraph(measure: (s: string) => number, text: string, maxWidth: n
   return lines;
 }
 
-function layOutPage(ctx: SKRSContext2D, page: ShamelaPage, highlightByParagraph: Map<number, PageHighlight>) {
+function layOutPage(ctx: SKRSContext2D, paragraphs: string[], highlightByParagraph: Map<number, PageHighlight>) {
   ctx.font = `${BODY_FONT_SIZE}px "${FONT_FAMILY}"`;
   const measure = (s: string) => ctx.measureText(s).width;
 
   const lines: LaidOutLine[] = [];
   let y = MARGIN_TOP;
-  for (const [i, text] of page.paragraphs.entries()) {
+  for (const [i, text] of paragraphs.entries()) {
     const highlight = highlightByParagraph.get(i + 1) ?? null;
     for (const lineText of wrapParagraph(measure, text, CONTENT_WIDTH)) {
       lines.push({ text: lineText, y, highlightColor: highlight?.color ?? null });
@@ -79,16 +79,84 @@ function layOutPage(ctx: SKRSContext2D, page: ShamelaPage, highlightByParagraph:
 }
 
 /**
- * Renders one shamela.ws reader page as a standalone image: the full page's text
- * (not just the cited excerpt — refetched in full so nothing looks cut off), laid
- * out right-to-left in Amiri, with the cited paragraph(s) highlighted in their
- * assigned color and a matching [N] badge per citation at the top.
+ * Draws one page's worth of already-fetched paragraphs as a standalone image —
+ * the full page's text laid out right-to-left in Amiri, with any highlighted
+ * paragraph(s) colored and given a matching [N] badge at the top. Pure and
+ * synchronous: no network fetch, no cache — callers that already have the page's
+ * paragraphs in hand (like /fetch, which fetches them anyway for the text embeds)
+ * can call this directly instead of paying for a second fetch of the same page.
  *
  * "Reader page N" is deliberately the label at the bottom, not just "N" or
  * anything styled to look like a scan — shamela.ws's page numbers are its own
  * reader's sequential pagination, not the printed book's real page number (see
  * fetchShamelaPage's docs), and this is a generated image, not an actual scan.
  * Mislabeling either would overstate how authoritative this image is.
+ */
+export function drawPageImage(paragraphs: string[], pageNumber: number, highlights: PageHighlight[] = []): Buffer {
+  const highlightByParagraph = new Map(highlights.map((h) => [h.paragraph, h]));
+
+  // Measuring pass on a throwaway canvas, purely to get correct text metrics
+  // (which depend on the registered font) before the real canvas — sized to fit
+  // however much text this specific page turns out to have — is created.
+  const { lines, contentBottom } = layOutPage(createCanvas(10, 10).getContext("2d"), paragraphs, highlightByParagraph);
+
+  const canvas = createCanvas(WIDTH, contentBottom);
+  const ctx = canvas.getContext("2d");
+
+  ctx.fillStyle = BACKGROUND;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Citation badges at top, one per highlight on this page, each colored to match
+  // its highlight below. No highlights (the plain /fetch case) means no badges.
+  const badgeFontSize = 26;
+  const badgeHeight = badgeFontSize + 20;
+  ctx.font = `bold ${badgeFontSize}px "${FONT_FAMILY}"`;
+  ctx.direction = "ltr";
+  ctx.textAlign = "left";
+  let badgeX = MARGIN_X;
+  for (const h of highlights.slice().sort((a, b) => a.citationNumber - b.citationNumber)) {
+    const label = `[${h.citationNumber}]`;
+    const labelWidth = ctx.measureText(label).width;
+    const chipWidth = labelWidth + 24;
+    ctx.fillStyle = h.color;
+    ctx.fillRect(badgeX, 40, chipWidth, badgeHeight);
+    ctx.fillStyle = "#1a1a1a";
+    ctx.fillText(label, badgeX + 12, 40 + badgeFontSize + 2);
+    badgeX += chipWidth + 12;
+  }
+
+  // Body text: highlight rectangle first (so it sits behind the glyphs like a
+  // real highlighter stroke), then the line's text on top.
+  ctx.font = `${BODY_FONT_SIZE}px "${FONT_FAMILY}"`;
+  ctx.direction = "rtl";
+  ctx.textAlign = "right";
+  for (const line of lines) {
+    if (line.highlightColor) {
+      const w = ctx.measureText(line.text).width;
+      ctx.fillStyle = line.highlightColor;
+      ctx.globalAlpha = 0.55;
+      ctx.fillRect(WIDTH - MARGIN_X - w - 6, line.y - BODY_FONT_SIZE, w + 12, LINE_HEIGHT);
+      ctx.globalAlpha = 1;
+    }
+    ctx.fillStyle = TEXT_COLOR;
+    ctx.fillText(line.text, WIDTH - MARGIN_X, line.y);
+  }
+
+  // Footer — see the "Reader page N" note in this function's docs above.
+  ctx.font = "20px Arial";
+  ctx.fillStyle = "#888888";
+  ctx.direction = "ltr";
+  ctx.textAlign = "center";
+  ctx.fillText(`Reader page ${pageNumber}`, WIDTH / 2, contentBottom - 30);
+
+  const buf = canvas.toBuffer("image/png");
+  return Buffer.isBuffer(buf) ? buf : Buffer.from(buf as Uint8Array);
+}
+
+/**
+ * Fetch-and-cache wrapper around drawPageImage, for callers (like /ask) that
+ * don't already have the page's paragraphs in hand. Caches both the underlying
+ * page fetch and the rendered image, keyed by book+page+highlight set.
  */
 export async function renderPageImage(bookUri: string, pageNumber: number, highlights: PageHighlight[]): Promise<Buffer> {
   const highlightKey = highlights
@@ -100,63 +168,7 @@ export async function renderPageImage(bookUri: string, pageNumber: number, highl
 
   const buf = await cached(imageCache, CACHE_TTL_MS, cacheKey, async () => {
     const page = await getFullPage(bookUri, pageNumber);
-    const highlightByParagraph = new Map(highlights.map((h) => [h.paragraph, h]));
-
-    // Measuring pass on a throwaway canvas, purely to get correct text metrics
-    // (which depend on the registered font) before the real canvas — sized to
-    // fit however much text this specific page turns out to have — is created.
-    const { lines, contentBottom } = layOutPage(createCanvas(10, 10).getContext("2d"), page, highlightByParagraph);
-
-    const canvas = createCanvas(WIDTH, contentBottom);
-    const ctx = canvas.getContext("2d");
-
-    ctx.fillStyle = BACKGROUND;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    // Citation badges at top, one per citation on this page, each colored to match
-    // its highlight below.
-    const badgeFontSize = 26;
-    const badgeHeight = badgeFontSize + 20;
-    ctx.font = `bold ${badgeFontSize}px "${FONT_FAMILY}"`;
-    ctx.direction = "ltr";
-    ctx.textAlign = "left";
-    let badgeX = MARGIN_X;
-    for (const h of highlights.slice().sort((a, b) => a.citationNumber - b.citationNumber)) {
-      const label = `[${h.citationNumber}]`;
-      const labelWidth = ctx.measureText(label).width;
-      const chipWidth = labelWidth + 24;
-      ctx.fillStyle = h.color;
-      ctx.fillRect(badgeX, 40, chipWidth, badgeHeight);
-      ctx.fillStyle = "#1a1a1a";
-      ctx.fillText(label, badgeX + 12, 40 + badgeFontSize + 2);
-      badgeX += chipWidth + 12;
-    }
-
-    // Body text: highlight rectangle first (so it sits behind the glyphs like a
-    // real highlighter stroke), then the line's text on top.
-    ctx.font = `${BODY_FONT_SIZE}px "${FONT_FAMILY}"`;
-    ctx.direction = "rtl";
-    ctx.textAlign = "right";
-    for (const line of lines) {
-      if (line.highlightColor) {
-        const w = ctx.measureText(line.text).width;
-        ctx.fillStyle = line.highlightColor;
-        ctx.globalAlpha = 0.55;
-        ctx.fillRect(WIDTH - MARGIN_X - w - 6, line.y - BODY_FONT_SIZE, w + 12, LINE_HEIGHT);
-        ctx.globalAlpha = 1;
-      }
-      ctx.fillStyle = TEXT_COLOR;
-      ctx.fillText(line.text, WIDTH - MARGIN_X, line.y);
-    }
-
-    // Footer — see the "Reader page N" note in this function's docs above.
-    ctx.font = "20px Arial";
-    ctx.fillStyle = "#888888";
-    ctx.direction = "ltr";
-    ctx.textAlign = "center";
-    ctx.fillText(`Reader page ${pageNumber}`, WIDTH / 2, contentBottom - 30);
-
-    return canvas.toBuffer("image/png");
+    return drawPageImage(page.paragraphs, pageNumber, highlights);
   });
 
   return Buffer.isBuffer(buf) ? buf : Buffer.from(buf as Uint8Array);
