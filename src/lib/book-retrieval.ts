@@ -1,18 +1,41 @@
 import { askGemini } from "./gemini.ts";
 import { searchWithinBook, fetchShamelaPage } from "./shamela-reader.ts";
-import { getBookText } from "./book-text-cache.ts";
+import { getBookParagraphs, type CachedParagraph } from "./book-text-cache.ts";
 
 const SEARCH_HIT_LIMIT = 5;
 const PAGE_DELAY_MS = 150;
 
+export type RetrievedParagraph = CachedParagraph;
+
 export interface RetrievedContext {
-  text: string;
+  paragraphs: RetrievedParagraph[];
   truncated: boolean;
-  /** True if `text` is grounded in shamela.ws's own search results for the
+  /** True if `paragraphs` is grounded in shamela.ws's own search results for the
    *  question, rather than just the book's opening pages. */
   usedSearch: boolean;
   /** The Arabic search phrase used, when usedSearch is true. */
   searchTerm?: string;
+}
+
+/**
+ * Renders a RetrievedContext into the indexed, citeable text block sent to the
+ * LLM: each paragraph tagged with its page and in-page position (e.g. "[P47:¶2]")
+ * so the model can cite back to the exact unit its claim came from, grouped under
+ * its page and (when known) section heading for readability.
+ */
+export function formatContextForPrompt(context: RetrievedContext): string {
+  const blocks: string[] = [];
+  let currentPage: number | null = null;
+
+  for (const p of context.paragraphs) {
+    if (p.page !== currentPage) {
+      currentPage = p.page;
+      const heading = p.sectionHeading ? ` — Section: ${p.sectionHeading}` : "";
+      blocks.push(`--- Page ${p.page}${heading} ---`);
+    }
+    blocks.push(`[P${p.page}:¶${p.paragraph}] ${p.text}`);
+  }
+  return blocks.join("\n");
 }
 
 /**
@@ -40,12 +63,13 @@ async function extractSearchTerm(question: string): Promise<string> {
 }
 
 /**
- * Gets the text most relevant to `question` from a book: tries shamela.ws's own
- * in-book search first (via a short Arabic phrase Groq extracts from the question),
- * fetching the full text of whichever pages it matches — since a large reference
- * work can run to several thousand pages, and the answer to a specific question is
- * rarely in its opening pages. Falls back to reading from page 1 (the old
- * behavior) if the search step fails or turns up nothing.
+ * Gets the text most relevant to `question` from a book, as individually-indexed
+ * paragraphs: tries shamela.ws's own in-book search first (via a short Arabic
+ * phrase Gemini extracts from the question), fetching the full text of whichever
+ * pages it matches — since a large reference work can run to several thousand
+ * pages, and the answer to a specific question is rarely in its opening pages.
+ * Falls back to reading from page 1 (the old behavior) if the search step fails
+ * or turns up nothing.
  */
 export async function getRelevantBookText(
   bookUri: string,
@@ -57,15 +81,13 @@ export async function getRelevantBookText(
     if (searchTerm) {
       const hits = await searchWithinBook(bookUri, searchTerm, SEARCH_HIT_LIMIT);
       if (hits.length > 0) {
-        const parts: string[] = [];
+        const paragraphs: RetrievedParagraph[] = [];
         let length = 0;
         let truncated = false;
 
-        for (const [i, hit] of hits.entries()) {
+        outer: for (const [i, hit] of hits.entries()) {
           if (i > 0) await new Promise((r) => setTimeout(r, PAGE_DELAY_MS));
           const page = await fetchShamelaPage(bookUri, hit.pageNumber);
-          const pageText = page.paragraphs.join("\n");
-          if (!pageText) continue;
 
           // The section heading matters more than it might look: a page's text alone
           // can read as a general statement when it's actually a narrow remark tied
@@ -74,19 +96,19 @@ export async function getRelevantBookText(
           // trick got mistaken by the model for a general statement on the unrelated
           // theological topic of the same word. Labeling which case/chapter a page
           // falls under is what lets the model catch that itself.
-          const heading = page.sectionHeading ? `Section: ${page.sectionHeading}\n` : "";
-          const block = `[Page ${hit.pageNumber}]\n${heading}${pageText}`;
-          if (length + block.length > targetChars) {
-            truncated = true;
-            if (parts.length === 0) parts.push(block.slice(0, targetChars));
-            break;
+          for (const [j, text] of page.paragraphs.entries()) {
+            if (!text) continue;
+            if (length + text.length > targetChars) {
+              truncated = true;
+              break outer;
+            }
+            paragraphs.push({ page: hit.pageNumber, paragraph: j + 1, text, sectionHeading: page.sectionHeading });
+            length += text.length;
           }
-          parts.push(block);
-          length += block.length;
         }
 
-        if (parts.length > 0) {
-          return { text: parts.join("\n\n---\n\n"), truncated, usedSearch: true, searchTerm };
+        if (paragraphs.length > 0) {
+          return { paragraphs, truncated, usedSearch: true, searchTerm };
         }
       }
     }
@@ -94,6 +116,6 @@ export async function getRelevantBookText(
     console.error("Search-based retrieval failed, falling back to reading from page 1:", err);
   }
 
-  const fallback = await getBookText(bookUri, targetChars);
-  return { text: fallback.text, truncated: fallback.truncated, usedSearch: false };
+  const fallback = await getBookParagraphs(bookUri, targetChars);
+  return { paragraphs: fallback.paragraphs, truncated: fallback.truncated, usedSearch: false };
 }

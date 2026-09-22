@@ -1,12 +1,17 @@
 import { SlashCommandBuilder, EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
 import { getBookByUri } from "../lib/db.ts";
-import { getRelevantBookText } from "../lib/book-retrieval.ts";
-import { askGemini } from "../lib/gemini.ts";
+import { getRelevantBookText, formatContextForPrompt } from "../lib/book-retrieval.ts";
+import { askGeminiJSON } from "../lib/gemini.ts";
 import { handleBookPickerAutocomplete, truncate } from "../lib/book-picker.ts";
 import { createCooldown } from "../lib/command-cooldown.ts";
+import { CITATION_ANSWER_SCHEMA, verifyCitations, type AnswerWithCitations, type VerifiedClaim } from "../lib/citation.ts";
 
 // ~2.5 chars/token is a safe estimate for this Arabic source text.
 const MAX_CONTEXT_CHARS = Number(process.env.GEMINI_MAX_CONTEXT_CHARS ?? 12_000);
+
+// 10 embeds/message is Discord's hard limit; 1 is reserved for the book-card meta
+// embed, leaving this many for individual claim citations.
+const MAX_CLAIM_EMBEDS = 9;
 
 // Each /ask call makes 2 Gemini requests (search-term extraction + the answer),
 // and this account's key is capped at 5 requests per minute — shared across every
@@ -91,6 +96,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   try {
     const context = await getRelevantBookText(book.uri, question, MAX_CONTEXT_CHARS);
+    const excerpt = formatContextForPrompt(context);
 
     const systemPrompt =
       "You are a careful research assistant answering questions about one specific classical Arabic " +
@@ -108,25 +114,41 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       "means\" inside a ruling on a sales transaction, not the theological topic of seeking intercession). " +
       "If a passage's ruling looks scoped to a specific case rather than the general topic, or a term looks " +
       "like it's being used in an unexpected sense, say so explicitly rather than presenting it as a general " +
-      "ruling. Explain and synthesize in your own words; you may quote a short phrase for precision, but " +
-      "never reproduce long verbatim passages. Reply in the same language the user asked in.";
+      "ruling.\n\n" +
+      "You must respond as structured JSON matching the given schema: break your answer into a small number " +
+      "of distinct factual claims (typically 2 to 6 — do not split into one claim per sentence). Every " +
+      "paragraph in the excerpt is tagged like \"[P47:¶2]\" (page 47, paragraph 2) — each claim's citations " +
+      "array must cite the exact page and paragraph number(s) that support it, taken only from those tags. " +
+      "Never cite a page/paragraph that isn't tagged in the excerpt. If a claim draws on more than one " +
+      "paragraph, cite all of them. If the excerpt doesn't support part of your answer, don't state that " +
+      "part as fact — set \"uncertain\" to true instead, and only include claims you can actually cite. " +
+      "Each claim's \"text\" should explain and synthesize in your own words; you may quote a short phrase " +
+      "for precision, but never reproduce long verbatim passages. Write in the same language the user asked in.";
 
     const userPrompt =
       `Book: ${book.book_name}\nAuthor: ${book.author_name}\nType: ${book.book_type}\n\n` +
-      `--- Excerpt${context.truncated ? " (truncated to fit)" : ""} ---\n${context.text}\n--- End of excerpt ---\n\n` +
+      `--- Excerpt${context.truncated ? " (truncated to fit)" : ""} ---\n${excerpt}\n--- End of excerpt ---\n\n` +
       `User's question/argument/claim: ${question}`;
 
-    // The scoping/sense-check instructions above give better answers room to explain
-    // *why* a ruling is narrow rather than just asserting it, which needs a bit more
-    // room than a flat answer — seen truncating mid-explanation at the old default.
+    // The scoping/sense-check instructions above, plus decomposing into cited
+    // claims, need a bit more reasoning room than a flat free-text answer —
     // thinkingLevel "low" keeps some reasoning capacity for that judgment call
-    // (recognizing a narrowly-scoped ruling or an unexpected sense of a term) while
-    // keeping the thinking-token overhead modest; maxTokens has headroom for both
-    // that overhead and the visible answer.
-    const answer = await askGemini(systemPrompt, userPrompt, {
-      maxTokens: 1500,
+    // (recognizing a narrowly-scoped ruling, an unexpected term sense, or which
+    // paragraph actually backs a claim) while keeping overhead modest; maxTokens
+    // has headroom for both that overhead and the structured output itself.
+    const result = await askGeminiJSON<AnswerWithCitations>(systemPrompt, userPrompt, {
+      maxTokens: 2000,
       thinkingLevel: "low",
+      responseSchema: CITATION_ANSWER_SCHEMA,
+      // Fires at most once, only if answering is taking longer than usual (a
+      // model fallback or retry sweep) — keeps the deferred reply reassuring
+      // instead of silent, without revealing why it's taking longer.
+      onRetrying: () => {
+        interaction.editReply("Still working on it — grounding your answer now…").catch(() => {});
+      },
     });
+
+    const verifiedClaims = verifyCitations(result, context);
 
     const footerNotes: string[] = [];
     if (context.usedSearch) {
@@ -137,12 +159,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         `No targeted match was found for this question, so ${context.truncated ? "only the opening portion of" : "the (short) full text of"} this book was used.`,
       );
     }
+    if (result.uncertain) {
+      footerNotes.push("⚠️ The model flagged this answer as not fully grounded in the excerpt.");
+    }
 
-    // Two embeds, mirroring /fetch's layout: a neutral "book card" up top, then the
-    // answer itself — colored by how it's grounded, since that's the one thing worth
-    // a glance before reading. Green = a targeted match was found and used; amber =
-    // fell back to the book's opening (a weaker signal — call this out visually, not
-    // just in the small footer text).
+    // A neutral "book card" up top, mirroring /fetch's layout — colored by how the
+    // excerpt itself was grounded (targeted search vs. opening-pages fallback).
     const metaEmbed = new EmbedBuilder()
       .setTitle(truncate(book.book_name, 256))
       .setURL(book.uri)
@@ -157,14 +179,47 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         { name: "Question", value: truncate(question, 1024) },
       );
     if (book.author_name) metaEmbed.setAuthor({ name: truncate(book.author_name, 256) });
+    if (verifiedClaims.length === 0) {
+      metaEmbed.addFields({ name: "No answer", value: "The excerpt didn't support any citable claim for this question." });
+    } else if (verifiedClaims.length > MAX_CLAIM_EMBEDS) {
+      metaEmbed.addFields({ name: "Note", value: `Showing ${MAX_CLAIM_EMBEDS} of ${verifiedClaims.length} claims.` });
+    }
 
-    const answerEmbed = new EmbedBuilder()
-      .setTitle("💬 Answer")
-      .setDescription(truncate(answer, 4000))
-      .setColor(context.usedSearch ? 0x38a169 : 0xdd6b20)
-      .setFooter({ text: footerNotes.join(" ") });
+    // One embed per claim: green if every citation checks out against the
+    // paragraphs actually retrieved, red if any citation points somewhere the
+    // model never saw (a provable hallucination — see citation.ts), gray if the
+    // model gave no citation at all for that claim.
+    const claimEmbeds = verifiedClaims.slice(0, MAX_CLAIM_EMBEDS).map((claim: VerifiedClaim, i: number) => {
+      const allVerified = claim.citations.length > 0 && claim.citations.every((c) => c.verified);
+      const color = claim.citations.length === 0 ? 0x718096 : allVerified ? 0x38a169 : 0xe53e3e;
 
-    await interaction.editReply({ embeds: [metaEmbed, answerEmbed] });
+      const embed = new EmbedBuilder().setTitle(`Claim ${i + 1}`).setDescription(truncate(claim.text, 4000)).setColor(color);
+
+      if (claim.citations.length === 0) {
+        embed.addFields({ name: "⚠️ No citation", value: "The model gave no source for this claim." });
+      }
+      for (const c of claim.citations) {
+        embed.addFields(
+          c.verified
+            ? { name: `📖 Page ${c.page}, ¶${c.paragraph}`, value: truncate(c.snippet!, 1024) }
+            : {
+                name: `⚠️ Page ${c.page}, ¶${c.paragraph}`,
+                value: "This citation doesn't match any paragraph actually retrieved for this answer — treat it with caution.",
+              },
+        );
+      }
+      return embed;
+    });
+
+    // Footer goes on the last embed in the message (Discord doesn't render a
+    // footer on anything but where it's set) — the last claim embed when there
+    // is one, otherwise the meta embed itself.
+    if (footerNotes.length > 0) {
+      const footerTarget = claimEmbeds[claimEmbeds.length - 1] ?? metaEmbed;
+      footerTarget.setFooter({ text: footerNotes.join(" ") });
+    }
+
+    await interaction.editReply({ embeds: [metaEmbed, ...claimEmbeds] });
   } catch (error) {
     console.error("Error in /ask:", error);
     await interaction.editReply(
