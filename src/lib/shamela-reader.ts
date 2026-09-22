@@ -92,7 +92,25 @@ export async function fetchShamelaPage(bookUrl: string, pageNumber = 1): Promise
   const bookId = extractBookId(bookUrl);
   const pageUrl = `https://shamela.ws/book/${bookId}/${pageNumber}`;
 
-  const root = await fetchHtml(pageUrl);
+  let root: HTMLElement;
+  try {
+    root = await fetchHtml(pageUrl);
+  } catch (err) {
+    // shamela.ws 404s any page number past the book's actual last page. Rather
+    // than surface that raw HTTP failure, look up the real last page (via page 1,
+    // which almost always exists) so the error is actionable instead of a bare
+    // "404 Not Found".
+    if (err instanceof Error && /\b404\b/.test(err.message) && pageNumber !== 1) {
+      const lastPageNumber = await fetchShamelaPage(bookUrl, 1)
+        .then((first) => first.lastPageNumber)
+        .catch(() => null);
+      if (lastPageNumber !== null) {
+        throw new Error(`Page ${pageNumber} doesn't exist for this book — it only has ${lastPageNumber} page(s).`);
+      }
+    }
+    throw err;
+  }
+
   const nass = root.querySelector(".nass");
   if (!nass) {
     throw new Error(
